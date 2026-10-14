@@ -1,6 +1,7 @@
 import io
 import os
 import pickle
+import urllib.error
 import urllib.request
 import warnings
 import jwt
@@ -62,14 +63,29 @@ if not os.path.exists(_CNN_MODEL_PATH):
             "Either place the model file at alzimer_backend/alzheimer_cnn_model.pkl, "
             "or set CNN_MODEL_URL to a direct-download link (e.g. a GitHub Release asset)."
         )
-    print("alzheimer_cnn_model.pkl not found locally — downloading from CNN_MODEL_URL...")
-    urllib.request.urlretrieve(_CNN_MODEL_URL, _CNN_MODEL_PATH)
-    print("Download complete.")
+    print(f"alzheimer_cnn_model.pkl not found locally — downloading from: {_CNN_MODEL_URL}")
+    try:
+        req = urllib.request.Request(_CNN_MODEL_URL, headers={"User-Agent": "mindbridge-deploy/1.0"})
+        with urllib.request.urlopen(req) as resp, open(_CNN_MODEL_PATH, "wb") as out:
+            out.write(resp.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"Failed to download alzheimer_cnn_model.pkl from CNN_MODEL_URL "
+            f"(HTTP {e.code} {e.reason}) — URL was: {_CNN_MODEL_URL}. "
+            "Check that this is the asset's direct download link (not the release "
+            "page), the tag/filename are exact, and the repo/asset is public."
+        ) from e
+    downloaded_size = os.path.getsize(_CNN_MODEL_PATH)
+    print(f"Download complete ({downloaded_size} bytes).")
 
 with open(_CNN_MODEL_PATH, "rb") as f:
     cnn_payload = pickle.load(f)
 
 _cnn_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if _cnn_device.type == "cpu":
+    # Keep thread-pool overhead (and its memory footprint) low on small/shared
+    # CPU-only instances — we only ever run one inference at a time per request.
+    torch.set_num_threads(1)
 
 def _build_resnet50(num_classes: int) -> nn.Module:
     net = models.resnet50(weights=None)
@@ -87,6 +103,10 @@ cnn_model = _build_resnet50(cnn_payload["num_classes"])
 cnn_model.load_state_dict(cnn_payload["model_state_dict"])
 cnn_model.to(_cnn_device)
 cnn_model.eval()
+
+# The state dict's values are now copied into cnn_model's own parameters —
+# drop this ~100MB duplicate instead of holding it for the process lifetime.
+del cnn_payload["model_state_dict"]
 
 _img_size = cnn_payload["img_size"]
 _cnn_classes = cnn_payload["classes"]
